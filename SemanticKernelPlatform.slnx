@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SemanticKernelPlatform.Api/SemanticKernelPlatform.Api.csproj" />
+    <Project Path="src/SemanticKernelPlatform.Application/SemanticKernelPlatform.Application.csproj" />
+    <Project Path="src/SemanticKernelPlatform.Infrastructure/SemanticKernelPlatform.Infrastructure.csproj" Id="2319e666-930f-4a19-821d-a34759c8c15b" />
+    <Project Path="src/SemanticKernelPlatform.Plugins/SemanticKernelPlatform.Plugins.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+</Solution>

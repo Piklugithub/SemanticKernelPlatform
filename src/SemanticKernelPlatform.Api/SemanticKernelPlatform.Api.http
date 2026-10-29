@@ -1,0 +1,6 @@
+@SemanticKernelPlatform.Api_HostAddress = http://localhost:5157
+
+GET {{SemanticKernelPlatform.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
