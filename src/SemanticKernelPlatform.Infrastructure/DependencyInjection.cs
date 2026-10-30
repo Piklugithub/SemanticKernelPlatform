@@ -2,8 +2,11 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
+using SemanticKernelPlatform.Application.Interfaces;
 using SemanticKernelPlatform.Application.Plugins;
+using SemanticKernelPlatform.Infrastructure.Services;
 using SemanticKernelPlatform.Plugins;
+using SemanticKernelPlatform.Plugins.Http;
 using SemanticKernelPlatform.Plugins.Platform;
 
 namespace SemanticKernelPlatform.Infrastructure;
@@ -35,10 +38,26 @@ public static class DependencyInjection
             ?? throw new InvalidOperationException(
                 "AI:Ollama:ModelId is not configured.");
 
-        services.AddSingleton<PlatformInfoPlugin>();
-        services.AddSingleton<IPluginRegistry, PluginRegistry>();
+        // Request-scoped API response storage.
+        services.AddScoped<ApiResponseContext>();
 
-        services.AddSingleton<Kernel>(serviceProvider =>
+        // Map the interface to the same scoped instance.
+        services.AddScoped<IApiResponseContext>(
+            serviceProvider =>
+                serviceProvider.GetRequiredService<ApiResponseContext>());
+
+        // API response processor.
+        services.AddSingleton<ApiResponseProcessor>();
+
+        // Plugins.
+        services.AddSingleton<PlatformInfoPlugin>();
+        services.AddHttpClient<HttpApiPlugin>();
+
+        // Plugin registry.
+        services.AddScoped<IPluginRegistry, PluginRegistry>();
+
+        // Create a separate Kernel for each request scope.
+        services.AddScoped<Kernel>(serviceProvider =>
         {
             var kernelBuilder = Kernel.CreateBuilder();
 
@@ -60,6 +79,9 @@ public static class DependencyInjection
 
             return kernel;
         });
+
+        // Chat service.
+        services.AddScoped<IChatService, ChatService>();
 
         return services;
     }
