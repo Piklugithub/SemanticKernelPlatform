@@ -2,11 +2,19 @@
 
 public interface IApiResponseContext
 {
-    string? RawResponse { get; }
-
     string? OperationName { get; }
-
-    void SetResponse(string operationName, string rawResponse);
+    string? RawResponse { get; }
+    string? Reply { get; }
+    string ResponseType { get; }
 
     void Clear();
+
+    void SetResponse(
+        string operationName,
+        string rawResponse);
+
+    void SetTextResponse(
+        string operationName,
+        string reply,
+        string responseType = "Text");
 }

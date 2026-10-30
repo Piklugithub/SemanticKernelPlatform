@@ -1,4 +1,5 @@
 ﻿
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
@@ -15,17 +16,20 @@ public sealed class ChatService : IChatService
     private readonly IConfiguration _configuration;
     private readonly IApiResponseContext _apiResponseContext;
     private readonly ApiResponseProcessor _apiResponseProcessor;
+    private readonly UserSearchProcessor _userSearchProcessor;
 
     public ChatService(
         Kernel kernel,
         IConfiguration configuration,
         IApiResponseContext apiResponseContext,
-        ApiResponseProcessor apiResponseProcessor)
+        ApiResponseProcessor apiResponseProcessor,
+        UserSearchProcessor userSearchProcessor)
     {
         _kernel = kernel;
         _configuration = configuration;
         _apiResponseContext = apiResponseContext;
         _apiResponseProcessor = apiResponseProcessor;
+        _userSearchProcessor = userSearchProcessor;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -42,7 +46,7 @@ public sealed class ChatService : IChatService
                 nameof(request));
         }
 
-        // Clear previous API response before processing a new message.
+        // Prevent data from a previous request being reused.
         _apiResponseContext.Clear();
 
         var history = new ChatHistory();
@@ -61,11 +65,6 @@ public sealed class ChatService : IChatService
             6. If an API call fails, explain the failure honestly.
             7. Present information in clear, natural language.
 
-            When retrieving records from an API:
-            - Select the appropriate registered API function.
-            - Do not invent, modify or replace API records.
-            - Do not fabricate names, IDs, email addresses or other fields.
-
             Integration-specific business instructions:
 
             {integrationInstructions}
@@ -78,40 +77,21 @@ public sealed class ChatService : IChatService
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
         };
 
-        // Let Semantic Kernel understand the request and execute
-        // the appropriate registered plugin.
         var response = await _chatCompletion.GetChatMessageContentAsync(
             history,
             executionSettings: settings,
             kernel: _kernel,
             cancellationToken: cancellationToken);
 
-        // Check whether an API plugin captured actual JSON data.
-        var rawApiResponse = _apiResponseContext.RawResponse;
+        // Process actual API data when GetUsers was invoked.
+        var processedResponse = ProcessApiResponse(request.Message);
 
-        if (!string.IsNullOrWhiteSpace(rawApiResponse))
+        if (processedResponse is not null)
         {
-            var operationName = _apiResponseContext.OperationName;
-
-            var title = GetTableTitle(operationName);
-
-            // Convert the original API JSON into structured table data.
-            var table = _apiResponseProcessor.CreateTable(
-                rawApiResponse,
-                title);
-
-            if (table is not null)
-            {
-                return new ChatResponse
-                {
-                    Reply = $"Successfully retrieved {table.TotalRecords} records.",
-                    ResponseType = "Table",
-                    Table = table
-                };
-            }
+            return processedResponse;
         }
 
-        // If no table data was captured, return the normal AI response.
+        // Default response when no deterministic processing is required.
         return new ChatResponse
         {
             Reply = response.Content ?? string.Empty,
@@ -119,16 +99,99 @@ public sealed class ChatService : IChatService
         };
     }
 
-    private string GetTableTitle(string? operationName)
+    private ChatResponse? ProcessApiResponse(string userMessage)
     {
-        return operationName switch
+        if (!string.Equals(
+                _apiResponseContext.OperationName,
+                "GetUsers",
+                StringComparison.OrdinalIgnoreCase))
         {
-            "GetUsers" => "Registered Users",
-            "GetGroups" => "Ticket Management Groups",
-            "GetTicketStatusCounts" => "Ticket Status Counts",
-            _ => "API Results"
+            return null;
+        }
+
+        var rawResponse = _apiResponseContext.RawResponse;
+
+        if (string.IsNullOrWhiteSpace(rawResponse))
+        {
+            return null;
+        }
+
+        var usersTable = _apiResponseProcessor.CreateTable(
+            rawResponse,
+            "Registered Users");
+
+        if (usersTable is null)
+        {
+            return null;
+        }
+
+        // If the user requested a specific name, filter deterministically.
+        if (TryExtractUserSearchTerm(userMessage, out var searchTerm))
+        {
+            return _userSearchProcessor.SearchUsers(
+                usersTable,
+                searchTerm);
+        }
+
+        // Otherwise, return all registered users.
+        return new ChatResponse
+        {
+            Reply = $"Successfully retrieved {usersTable.TotalRecords} records.",
+            ResponseType = "Table",
+            Table = usersTable
         };
     }
+
+
+    private static bool TryExtractUserSearchTerm(
+        string message,
+        out string searchTerm)
+    {
+        searchTerm = string.Empty;
+
+        var patterns = new[]
+        {
+        // Is Sayan registered?
+        @"^\s*(?:is|are)\s+(?<name>.+?)\s+(?:registered|a registered user)\s*[?.!]*\s*$",
+
+        // Find Sayan
+        // Find Sayan details
+        // Find users named Sayan
+        // Search for Sayan details
+        @"^\s*(?:find|search for|look for)\s+(?:users?\s+(?:named|called)\s+)?(?<name>.+?)\s*[?.!]*\s*$",
+
+        // Show me users named Sayan
+        // List users called Sayan
+        @"^\s*(?:show|list)\s+(?:me\s+)?users?\s+(?:named|called)\s+(?<name>.+?)\s*[?.!]*\s*$"
+    };
+
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(
+                message,
+                pattern,
+                RegexOptions.IgnoreCase |
+                RegexOptions.CultureInvariant);
+
+            if (!match.Success)
+                continue;
+
+            searchTerm = match.Groups["name"].Value.Trim();
+
+            // Remove common conversational suffixes.
+            searchTerm = Regex.Replace(
+                searchTerm,
+                @"\s+(?:details|information|info|records|profile)$",
+                string.Empty,
+                RegexOptions.IgnoreCase |
+                RegexOptions.CultureInvariant).Trim();
+
+            return !string.IsNullOrWhiteSpace(searchTerm);
+        }
+
+        return false;
+    }
+
 
     private string GetIntegrationInstructions()
     {
@@ -146,10 +209,8 @@ public sealed class ChatService : IChatService
 
                 return $"Integration: {integration.Key}\n{description}";
             })
-            .OfType<string>();
+            .Where(instruction => instruction is not null);
 
-        return string.Join(
-            "\n\n",
-            instructions);
+        return string.Join("\n\n", instructions);
     }
 }

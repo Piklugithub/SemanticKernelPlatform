@@ -38,19 +38,15 @@ public static class DependencyInjection
             ?? throw new InvalidOperationException(
                 "AI:Ollama:ModelId is not configured.");
 
-        // Request-scoped API response storage.
-        services.AddScoped<ApiResponseContext>();
-
         // Map the interface to the same scoped instance.
-        services.AddScoped<IApiResponseContext>(
-            serviceProvider =>
-                serviceProvider.GetRequiredService<ApiResponseContext>());
+        services.AddScoped<IApiResponseContext, ApiResponseContext>();
 
         // API response processor.
         services.AddSingleton<ApiResponseProcessor>();
+        services.AddSingleton<UserSearchProcessor>();
 
         // Plugins.
-        services.AddSingleton<PlatformInfoPlugin>();
+        services.AddScoped<PlatformInfoPlugin>();
         services.AddHttpClient<HttpApiPlugin>();
 
         // Plugin registry.
