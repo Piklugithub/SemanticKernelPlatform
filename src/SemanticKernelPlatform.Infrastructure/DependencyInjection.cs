@@ -44,6 +44,7 @@ public static class DependencyInjection
         // API response processor.
         services.AddSingleton<ApiResponseProcessor>();
         services.AddSingleton<UserSearchProcessor>();
+        services.AddSingleton<TicketCountProcessor>();
 
         // Plugins.
         services.AddScoped<PlatformInfoPlugin>();

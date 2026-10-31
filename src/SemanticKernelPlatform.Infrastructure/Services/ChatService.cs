@@ -17,19 +17,22 @@ public sealed class ChatService : IChatService
     private readonly IApiResponseContext _apiResponseContext;
     private readonly ApiResponseProcessor _apiResponseProcessor;
     private readonly UserSearchProcessor _userSearchProcessor;
+    private readonly TicketCountProcessor _ticketCountProcessor;
 
     public ChatService(
         Kernel kernel,
         IConfiguration configuration,
         IApiResponseContext apiResponseContext,
         ApiResponseProcessor apiResponseProcessor,
-        UserSearchProcessor userSearchProcessor)
+        UserSearchProcessor userSearchProcessor,
+        TicketCountProcessor ticketCountProcessor)
     {
         _kernel = kernel;
         _configuration = configuration;
         _apiResponseContext = apiResponseContext;
         _apiResponseProcessor = apiResponseProcessor;
         _userSearchProcessor = userSearchProcessor;
+        _ticketCountProcessor = ticketCountProcessor;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -99,48 +102,80 @@ public sealed class ChatService : IChatService
         };
     }
 
+
     private ChatResponse? ProcessApiResponse(string userMessage)
     {
-        if (!string.Equals(
-                _apiResponseContext.OperationName,
+        var operationName = _apiResponseContext.OperationName;
+        var rawResponse = _apiResponseContext.RawResponse;
+
+        if (string.IsNullOrWhiteSpace(operationName) ||
+            string.IsNullOrWhiteSpace(rawResponse))
+        {
+            return null;
+        }
+
+        // Process user records.
+        if (string.Equals(
+                operationName,
                 "GetUsers",
                 StringComparison.OrdinalIgnoreCase))
         {
-            return null;
+            var usersTable = _apiResponseProcessor.CreateTable(
+                rawResponse,
+                "Registered Users");
+
+            if (usersTable is null)
+                return null;
+
+            if (TryExtractUserSearchTerm(userMessage, out var searchTerm))
+            {
+                return _userSearchProcessor.SearchUsers(
+                    usersTable,
+                    searchTerm);
+            }
+
+            return new ChatResponse
+            {
+                Reply = $"Successfully retrieved {usersTable.TotalRecords} records.",
+                ResponseType = "Table",
+                Table = usersTable
+            };
         }
 
-        var rawResponse = _apiResponseContext.RawResponse;
-
-        if (string.IsNullOrWhiteSpace(rawResponse))
+        // Process actual ticket counts.
+        if (string.Equals(
+                operationName,
+                "GetTicketStatusCounts",
+                StringComparison.OrdinalIgnoreCase))
         {
-            return null;
+            var ticketTable = _apiResponseProcessor.CreateTable(
+                rawResponse,
+                "Ticket Counts by Status");
+
+            if (ticketTable is null)
+                return null;
+
+            // Return the actual count when a particular status is requested.
+            if (TryExtractTicketStatus(userMessage, out var status))
+            {
+                return _ticketCountProcessor.GetCountByStatus(
+                    ticketTable,
+                    status);
+            }
+
+            // Otherwise, return the actual status/count table.
+            return new ChatResponse
+            {
+                Reply = $"Successfully retrieved ticket counts. Total tickets: {ticketTable.Rows.Sum(row => int.TryParse(row.LastOrDefault(), out var count) ? count : 0)}.",
+                ResponseType = "Table",
+                Table = ticketTable
+            };
         }
 
-        var usersTable = _apiResponseProcessor.CreateTable(
-            rawResponse,
-            "Registered Users");
-
-        if (usersTable is null)
-        {
-            return null;
-        }
-
-        // If the user requested a specific name, filter deterministically.
-        if (TryExtractUserSearchTerm(userMessage, out var searchTerm))
-        {
-            return _userSearchProcessor.SearchUsers(
-                usersTable,
-                searchTerm);
-        }
-
-        // Otherwise, return all registered users.
-        return new ChatResponse
-        {
-            Reply = $"Successfully retrieved {usersTable.TotalRecords} records.",
-            ResponseType = "Table",
-            Table = usersTable
-        };
+        return null;
     }
+
+
 
 
     private static bool TryExtractUserSearchTerm(
@@ -154,15 +189,16 @@ public sealed class ChatService : IChatService
         // Is Sayan registered?
         @"^\s*(?:is|are)\s+(?<name>.+?)\s+(?:registered|a registered user)\s*[?.!]*\s*$",
 
-        // Find Sayan
-        // Find Sayan details
-        // Find users named Sayan
-        // Search for Sayan details
+        // Find Sayan / Find Sayan details
+        // Search for Sayan
         @"^\s*(?:find|search for|look for)\s+(?:users?\s+(?:named|called)\s+)?(?<name>.+?)\s*[?.!]*\s*$",
 
         // Show me users named Sayan
-        // List users called Sayan
-        @"^\s*(?:show|list)\s+(?:me\s+)?users?\s+(?:named|called)\s+(?<name>.+?)\s*[?.!]*\s*$"
+        @"^\s*(?:show|list)\s+(?:me\s+)?users?\s+(?:named|called)\s+(?<name>.+?)\s*[?.!]*\s*$",
+
+        // Get me the details of Sayan
+        // Give me information about Sayan
+        @"^\s*(?:get|give|show|tell)\s+(?:me\s+)?(?:the\s+)?(?:details|information|info|profile)\s+(?:of|for|about)\s+(?<name>.+?)\s*[?.!]*\s*$"
     };
 
         foreach (var pattern in patterns)
@@ -178,7 +214,6 @@ public sealed class ChatService : IChatService
 
             searchTerm = match.Groups["name"].Value.Trim();
 
-            // Remove common conversational suffixes.
             searchTerm = Regex.Replace(
                 searchTerm,
                 @"\s+(?:details|information|info|records|profile)$",
@@ -191,6 +226,56 @@ public sealed class ChatService : IChatService
 
         return false;
     }
+
+
+
+    private static bool TryExtractTicketStatus(
+        string message,
+        out string status)
+    {
+        status = string.Empty;
+
+        const string statusPattern =
+            @"(?<status>open|active|resolved|on[\s-]*hold)";
+
+        var patterns = new[]
+        {
+        // How many tickets are currently open?
+        // How many tickets are open?
+        $@"^\s*how many\s+tickets?\s+(?:are\s+)?(?:currently\s+)?{statusPattern}\s*[?.!]*\s*$",
+
+        // How many open tickets?
+        // How many active tickets?
+        $@"^\s*how many\s+{statusPattern}\s+tickets?\s*[?.!]*\s*$",
+
+        // How many tickets have status open?
+        $@"^\s*how many\s+tickets?\s+(?:have|with)\s+(?:the\s+)?status\s+{statusPattern}\s*[?.!]*\s*$",
+
+        // Count open tickets
+        // Count of open tickets
+        $@"^\s*(?:count|number)\s+(?:of\s+)?{statusPattern}\s+tickets?\s*[?.!]*\s*$"
+    };
+
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(
+                message,
+                pattern,
+                RegexOptions.IgnoreCase |
+                RegexOptions.CultureInvariant);
+
+            if (!match.Success)
+                continue;
+
+            status = match.Groups["status"].Value.Trim();
+
+            return !string.IsNullOrWhiteSpace(status);
+        }
+
+        return false;
+    }
+
+
 
 
     private string GetIntegrationInstructions()
