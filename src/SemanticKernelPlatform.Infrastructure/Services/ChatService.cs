@@ -1,6 +1,4 @@
 ﻿
-using System.Text.RegularExpressions;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -11,28 +9,30 @@ namespace SemanticKernelPlatform.Infrastructure.Services;
 
 public sealed class ChatService : IChatService
 {
+    private const string PluginName = "HttpApi";
+
     private readonly Kernel _kernel;
     private readonly IChatCompletionService _chatCompletion;
-    private readonly IConfiguration _configuration;
     private readonly IApiResponseContext _apiResponseContext;
     private readonly ApiResponseProcessor _apiResponseProcessor;
     private readonly UserSearchProcessor _userSearchProcessor;
     private readonly TicketCountProcessor _ticketCountProcessor;
+    private readonly IIntentExtractionService _intentExtractionService;
 
     public ChatService(
         Kernel kernel,
-        IConfiguration configuration,
         IApiResponseContext apiResponseContext,
         ApiResponseProcessor apiResponseProcessor,
         UserSearchProcessor userSearchProcessor,
-        TicketCountProcessor ticketCountProcessor)
+        TicketCountProcessor ticketCountProcessor,
+        IIntentExtractionService intentExtractionService)
     {
         _kernel = kernel;
-        _configuration = configuration;
         _apiResponseContext = apiResponseContext;
         _apiResponseProcessor = apiResponseProcessor;
         _userSearchProcessor = userSearchProcessor;
         _ticketCountProcessor = ticketCountProcessor;
+        _intentExtractionService = intentExtractionService;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -52,49 +52,216 @@ public sealed class ChatService : IChatService
         // Prevent data from a previous request being reused.
         _apiResponseContext.Clear();
 
+        // Step 1: Understand the user's intent.
+        var intent = await _intentExtractionService.ExtractIntentAsync(
+            request.Message,
+            cancellationToken);
+
+        // Step 2: Execute the appropriate operation.
+        switch (intent.Intent)
+        {
+            case IntentType.GetAllUsers:
+            case IntentType.SearchUsers:
+
+                return await ExecuteApiOperationAsync(
+                    "GetUsers",
+                    intent,
+                    cancellationToken);
+
+            case IntentType.GetTicketCount:
+            case IntentType.GetTicketCountsByStatus:
+
+                return await ExecuteApiOperationAsync(
+                    "GetTicketStatusCounts",
+                    intent,
+                    cancellationToken);
+
+            case IntentType.GetGroups:
+
+                return await ExecuteApiOperationAsync(
+                    "GetGroups",
+                    intent,
+                    cancellationToken);
+
+            case IntentType.Unknown:
+            default:
+
+                return await HandleUnknownIntentAsync(
+                    request.Message,
+                    cancellationToken);
+        }
+    }
+
+    private async Task<ChatResponse> ExecuteApiOperationAsync(
+        string functionName,
+        UserIntent intent,
+        CancellationToken cancellationToken)
+    {
+        // Retrieve the registered Kernel function.
+        var function = _kernel.Plugins.GetFunction(
+            PluginName,
+            functionName);
+
+        // Invoke the function directly.
+        // No automatic function selection or additional tool-calling
+        // completion is required for these known operations.
+        var functionResult = await _kernel.InvokeAsync(
+            function,
+            cancellationToken: cancellationToken);
+
+        // Read the actual API response captured by HttpApiPlugin.
+        var rawResponse = _apiResponseContext.RawResponse;
+        var operationName = _apiResponseContext.OperationName;
+
+        // Handle API failures or missing response data.
+        if (string.IsNullOrWhiteSpace(rawResponse) ||
+            string.IsNullOrWhiteSpace(operationName))
+        {
+            return new ChatResponse
+            {
+                Reply = functionResult.ToString(),
+                ResponseType = "Text"
+            };
+        }
+
+        return ProcessApiResponse(intent, operationName, rawResponse);
+    }
+
+    private ChatResponse ProcessApiResponse(
+        UserIntent intent,
+        string operationName,
+        string rawResponse)
+    {
+        switch (operationName)
+        {
+            case "GetUsers":
+                {
+                    var usersTable = _apiResponseProcessor.CreateTable(
+                        rawResponse,
+                        "Registered Users");
+
+                    if (usersTable is null)
+                    {
+                        return CreateErrorResponse(
+                            "Unable to process the registered users response.");
+                    }
+
+                    if (intent.Intent == IntentType.SearchUsers)
+                    {
+                        if (string.IsNullOrWhiteSpace(intent.SearchTerm))
+                        {
+                            return CreateErrorResponse(
+                                "I couldn't identify the user's name to search for.");
+                        }
+
+                        return _userSearchProcessor.SearchUsers(
+                            usersTable,
+                            intent.SearchTerm);
+                    }
+
+                    return new ChatResponse
+                    {
+                        Reply = $"Successfully retrieved {usersTable.TotalRecords} registered users.",
+                        ResponseType = "Table",
+                        Table = usersTable
+                    };
+                }
+
+            case "GetTicketStatusCounts":
+                {
+                    var ticketTable = _apiResponseProcessor.CreateTable(
+                        rawResponse,
+                        "Ticket Counts by Status");
+
+                    if (ticketTable is null)
+                    {
+                        return CreateErrorResponse(
+                            "Unable to process the ticket count response.");
+                    }
+
+                    if (intent.Intent == IntentType.GetTicketCount)
+                    {
+                        if (string.IsNullOrWhiteSpace(intent.Status))
+                        {
+                            return CreateErrorResponse(
+                                "I couldn't identify the ticket status.");
+                        }
+
+                        return _ticketCountProcessor.GetCountByStatus(
+                            ticketTable,
+                            intent.Status);
+                    }
+
+                    var totalTickets = ticketTable.Rows.Sum(row =>
+                        int.TryParse(
+                            row.LastOrDefault(),
+                            out var count)
+                                ? count
+                                : 0);
+
+                    return new ChatResponse
+                    {
+                        Reply = $"Successfully retrieved ticket counts. Total tickets: {totalTickets}.",
+                        ResponseType = "Table",
+                        Table = ticketTable
+                    };
+                }
+
+            case "GetGroups":
+                {
+                    var groupsTable = _apiResponseProcessor.CreateTable(
+                        rawResponse,
+                        "Registered Groups");
+
+                    if (groupsTable is null)
+                    {
+                        return CreateErrorResponse(
+                            "Unable to process the groups response.");
+                    }
+
+                    return new ChatResponse
+                    {
+                        Reply = $"Successfully retrieved {groupsTable.TotalRecords} groups.",
+                        ResponseType = "Table",
+                        Table = groupsTable
+                    };
+                }
+
+            default:
+                return CreateErrorResponse(
+                    $"Unsupported API operation: {operationName}");
+        }
+    }
+
+    private async Task<ChatResponse> HandleUnknownIntentAsync(
+        string userMessage,
+        CancellationToken cancellationToken)
+    {
         var history = new ChatHistory();
 
-        var integrationInstructions = GetIntegrationInstructions();
+        history.AddSystemMessage("""
+            You are an intelligent enterprise assistant.
 
-        history.AddSystemMessage($"""
-            You are an intelligent enterprise AI assistant.
+            You currently support these business operations:
+            - Retrieving registered users.
+            - Searching registered users.
+            - Retrieving ticket counts.
+            - Retrieving ticket counts by status.
+            - Retrieving registered groups.
 
-            Your responsibilities:
-            1. Understand user requests using natural language.
-            2. Use registered plugins when external API data is required.
-            3. Never ask users for internal plugin or function names.
-            4. Never invent API results or business information.
-            5. Use actual API responses when answering questions.
-            6. If an API call fails, explain the failure honestly.
-            7. Present information in clear, natural language.
+            If the user asks about something outside these capabilities,
+            politely explain the supported capabilities.
 
-            Integration-specific business instructions:
-
-            {integrationInstructions}
+            Never invent business information or API results.
+            Do not claim that an API operation was executed.
             """);
 
-        history.AddUserMessage(request.Message);
-
-        var settings = new PromptExecutionSettings
-        {
-            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
-        };
+        history.AddUserMessage(userMessage);
 
         var response = await _chatCompletion.GetChatMessageContentAsync(
             history,
-            executionSettings: settings,
-            kernel: _kernel,
             cancellationToken: cancellationToken);
 
-        // Process actual API data when GetUsers was invoked.
-        var processedResponse = ProcessApiResponse(request.Message);
-
-        if (processedResponse is not null)
-        {
-            return processedResponse;
-        }
-
-        // Default response when no deterministic processing is required.
         return new ChatResponse
         {
             Reply = response.Content ?? string.Empty,
@@ -102,200 +269,12 @@ public sealed class ChatService : IChatService
         };
     }
 
-
-    private ChatResponse? ProcessApiResponse(string userMessage)
+    private static ChatResponse CreateErrorResponse(string message)
     {
-        var operationName = _apiResponseContext.OperationName;
-        var rawResponse = _apiResponseContext.RawResponse;
-
-        if (string.IsNullOrWhiteSpace(operationName) ||
-            string.IsNullOrWhiteSpace(rawResponse))
+        return new ChatResponse
         {
-            return null;
-        }
-
-        // Process user records.
-        if (string.Equals(
-                operationName,
-                "GetUsers",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            var usersTable = _apiResponseProcessor.CreateTable(
-                rawResponse,
-                "Registered Users");
-
-            if (usersTable is null)
-                return null;
-
-            if (TryExtractUserSearchTerm(userMessage, out var searchTerm))
-            {
-                return _userSearchProcessor.SearchUsers(
-                    usersTable,
-                    searchTerm);
-            }
-
-            return new ChatResponse
-            {
-                Reply = $"Successfully retrieved {usersTable.TotalRecords} records.",
-                ResponseType = "Table",
-                Table = usersTable
-            };
-        }
-
-        // Process actual ticket counts.
-        if (string.Equals(
-                operationName,
-                "GetTicketStatusCounts",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            var ticketTable = _apiResponseProcessor.CreateTable(
-                rawResponse,
-                "Ticket Counts by Status");
-
-            if (ticketTable is null)
-                return null;
-
-            // Return the actual count when a particular status is requested.
-            if (TryExtractTicketStatus(userMessage, out var status))
-            {
-                return _ticketCountProcessor.GetCountByStatus(
-                    ticketTable,
-                    status);
-            }
-
-            // Otherwise, return the actual status/count table.
-            return new ChatResponse
-            {
-                Reply = $"Successfully retrieved ticket counts. Total tickets: {ticketTable.Rows.Sum(row => int.TryParse(row.LastOrDefault(), out var count) ? count : 0)}.",
-                ResponseType = "Table",
-                Table = ticketTable
-            };
-        }
-
-        return null;
-    }
-
-
-
-
-    private static bool TryExtractUserSearchTerm(
-        string message,
-        out string searchTerm)
-    {
-        searchTerm = string.Empty;
-
-        var patterns = new[]
-        {
-        // Is Sayan registered?
-        @"^\s*(?:is|are)\s+(?<name>.+?)\s+(?:registered|a registered user)\s*[?.!]*\s*$",
-
-        // Find Sayan / Find Sayan details
-        // Search for Sayan
-        @"^\s*(?:find|search for|look for)\s+(?:users?\s+(?:named|called)\s+)?(?<name>.+?)\s*[?.!]*\s*$",
-
-        // Show me users named Sayan
-        @"^\s*(?:show|list)\s+(?:me\s+)?users?\s+(?:named|called)\s+(?<name>.+?)\s*[?.!]*\s*$",
-
-        // Get me the details of Sayan
-        // Give me information about Sayan
-        @"^\s*(?:get|give|show|tell)\s+(?:me\s+)?(?:the\s+)?(?:details|information|info|profile)\s+(?:of|for|about)\s+(?<name>.+?)\s*[?.!]*\s*$"
-    };
-
-        foreach (var pattern in patterns)
-        {
-            var match = Regex.Match(
-                message,
-                pattern,
-                RegexOptions.IgnoreCase |
-                RegexOptions.CultureInvariant);
-
-            if (!match.Success)
-                continue;
-
-            searchTerm = match.Groups["name"].Value.Trim();
-
-            searchTerm = Regex.Replace(
-                searchTerm,
-                @"\s+(?:details|information|info|records|profile)$",
-                string.Empty,
-                RegexOptions.IgnoreCase |
-                RegexOptions.CultureInvariant).Trim();
-
-            return !string.IsNullOrWhiteSpace(searchTerm);
-        }
-
-        return false;
-    }
-
-
-
-    private static bool TryExtractTicketStatus(
-        string message,
-        out string status)
-    {
-        status = string.Empty;
-
-        const string statusPattern =
-            @"(?<status>open|active|resolved|on[\s-]*hold)";
-
-        var patterns = new[]
-        {
-        // How many tickets are currently open?
-        // How many tickets are open?
-        $@"^\s*how many\s+tickets?\s+(?:are\s+)?(?:currently\s+)?{statusPattern}\s*[?.!]*\s*$",
-
-        // How many open tickets?
-        // How many active tickets?
-        $@"^\s*how many\s+{statusPattern}\s+tickets?\s*[?.!]*\s*$",
-
-        // How many tickets have status open?
-        $@"^\s*how many\s+tickets?\s+(?:have|with)\s+(?:the\s+)?status\s+{statusPattern}\s*[?.!]*\s*$",
-
-        // Count open tickets
-        // Count of open tickets
-        $@"^\s*(?:count|number)\s+(?:of\s+)?{statusPattern}\s+tickets?\s*[?.!]*\s*$"
-    };
-
-        foreach (var pattern in patterns)
-        {
-            var match = Regex.Match(
-                message,
-                pattern,
-                RegexOptions.IgnoreCase |
-                RegexOptions.CultureInvariant);
-
-            if (!match.Success)
-                continue;
-
-            status = match.Groups["status"].Value.Trim();
-
-            return !string.IsNullOrWhiteSpace(status);
-        }
-
-        return false;
-    }
-
-
-
-
-    private string GetIntegrationInstructions()
-    {
-        var integrations = _configuration
-            .GetSection("ApiIntegrations")
-            .GetChildren();
-
-        var instructions = integrations
-            .Select(integration =>
-            {
-                var description = integration["SystemInstructions"];
-
-                if (string.IsNullOrWhiteSpace(description))
-                    return null;
-
-                return $"Integration: {integration.Key}\n{description}";
-            })
-            .Where(instruction => instruction is not null);
-
-        return string.Join("\n\n", instructions);
+            Reply = message,
+            ResponseType = "Text"
+        };
     }
 }

@@ -76,6 +76,7 @@ public static class DependencyInjection
 
             return kernel;
         });
+        services.AddScoped<IIntentExtractionService, IntentExtractionService>();
 
         // Chat service.
         services.AddScoped<IChatService, ChatService>();
