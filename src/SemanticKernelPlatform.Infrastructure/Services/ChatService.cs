@@ -1,4 +1,5 @@
 ﻿
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -17,7 +18,9 @@ public sealed class ChatService : IChatService
     private readonly ApiResponseProcessor _apiResponseProcessor;
     private readonly UserSearchProcessor _userSearchProcessor;
     private readonly TicketCountProcessor _ticketCountProcessor;
+    private readonly TicketAnalysisProcessor _ticketAnalysisProcessor;
     private readonly IIntentExtractionService _intentExtractionService;
+    private readonly IChatHistoryStore _chatHistoryStore;
 
     public ChatService(
         Kernel kernel,
@@ -25,14 +28,18 @@ public sealed class ChatService : IChatService
         ApiResponseProcessor apiResponseProcessor,
         UserSearchProcessor userSearchProcessor,
         TicketCountProcessor ticketCountProcessor,
-        IIntentExtractionService intentExtractionService)
+        TicketAnalysisProcessor ticketAnalysisProcessor,
+        IIntentExtractionService intentExtractionService,
+        IChatHistoryStore chatHistoryStore)
     {
         _kernel = kernel;
         _apiResponseContext = apiResponseContext;
         _apiResponseProcessor = apiResponseProcessor;
         _userSearchProcessor = userSearchProcessor;
         _ticketCountProcessor = ticketCountProcessor;
+        _ticketAnalysisProcessor = ticketAnalysisProcessor;
         _intentExtractionService = intentExtractionService;
+        _chatHistoryStore = chatHistoryStore;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -49,47 +56,104 @@ public sealed class ChatService : IChatService
                 nameof(request));
         }
 
-        // Prevent data from a previous request being reused.
+        // Step 1: Resolve the conversation ID.
+        var conversationId = string.IsNullOrWhiteSpace(
+            request.ConversationId)
+                ? Guid.NewGuid().ToString("N")
+                : request.ConversationId;
+
+        // Step 2: Load previous conversation messages.
+        var previousMessages =
+            await _chatHistoryStore.GetMessagesAsync(
+                conversationId,
+                cancellationToken);
+
+        // Prevent data from a previous API request being reused.
         _apiResponseContext.Clear();
 
-        // Step 1: Understand the user's intent.
+        // Step 3: Understand the user's intent.
+        // Context-aware intent extraction will be added in the next step.
         var intent = await _intentExtractionService.ExtractIntentAsync(
             request.Message,
+            previousMessages,
             cancellationToken);
 
-        // Step 2: Execute the appropriate operation.
+        // Step 4: Execute the appropriate operation.
+        ChatResponse response;
+
         switch (intent.Intent)
         {
             case IntentType.GetAllUsers:
             case IntentType.SearchUsers:
 
-                return await ExecuteApiOperationAsync(
+                response = await ExecuteApiOperationAsync(
                     "GetUsers",
                     intent,
                     cancellationToken);
+                break;
 
             case IntentType.GetTicketCount:
             case IntentType.GetTicketCountsByStatus:
+            case IntentType.AnalyzeTicketDistribution:
 
-                return await ExecuteApiOperationAsync(
+                response = await ExecuteApiOperationAsync(
                     "GetTicketStatusCounts",
                     intent,
                     cancellationToken);
+                break;
 
             case IntentType.GetGroups:
 
-                return await ExecuteApiOperationAsync(
+                response = await ExecuteApiOperationAsync(
                     "GetGroups",
                     intent,
                     cancellationToken);
+                break;
 
             case IntentType.Unknown:
             default:
 
-                return await HandleUnknownIntentAsync(
+                response = await HandleUnknownIntentAsync(
                     request.Message,
+                    previousMessages,
                     cancellationToken);
+                break;
         }
+
+        // Step 5: Attach the conversation ID to the response.
+        response.ConversationId = conversationId;
+
+        // Step 6: Save the current user and assistant messages.
+        await SaveConversationMessagesAsync(
+            conversationId,
+            request.Message,
+            response.Reply,
+            cancellationToken);
+
+        return response;
+    }
+
+    private async Task SaveConversationMessagesAsync(
+        string conversationId,
+        string userMessage,
+        string assistantMessage,
+        CancellationToken cancellationToken)
+    {
+        await _chatHistoryStore.AddMessageAsync(
+            conversationId,
+            new ConversationMessage(
+                "user",
+                userMessage,
+                DateTime.UtcNow),
+            cancellationToken);
+
+        await _chatHistoryStore.AddMessageAsync(
+            conversationId,
+            new ConversationMessage(
+                "assistant",
+                assistantMessage,
+                DateTime.UtcNow),
+            cancellationToken);
     }
 
     private async Task<ChatResponse> ExecuteApiOperationAsync(
@@ -97,23 +161,17 @@ public sealed class ChatService : IChatService
         UserIntent intent,
         CancellationToken cancellationToken)
     {
-        // Retrieve the registered Kernel function.
         var function = _kernel.Plugins.GetFunction(
             PluginName,
             functionName);
 
-        // Invoke the function directly.
-        // No automatic function selection or additional tool-calling
-        // completion is required for these known operations.
         var functionResult = await _kernel.InvokeAsync(
             function,
             cancellationToken: cancellationToken);
 
-        // Read the actual API response captured by HttpApiPlugin.
         var rawResponse = _apiResponseContext.RawResponse;
         var operationName = _apiResponseContext.OperationName;
 
-        // Handle API failures or missing response data.
         if (string.IsNullOrWhiteSpace(rawResponse) ||
             string.IsNullOrWhiteSpace(operationName))
         {
@@ -124,13 +182,18 @@ public sealed class ChatService : IChatService
             };
         }
 
-        return ProcessApiResponse(intent, operationName, rawResponse);
+        return await ProcessApiResponseAsync(
+            intent,
+            operationName,
+            rawResponse,
+            cancellationToken);
     }
 
-    private ChatResponse ProcessApiResponse(
+    private async Task<ChatResponse> ProcessApiResponseAsync(
         UserIntent intent,
         string operationName,
-        string rawResponse)
+        string rawResponse,
+        CancellationToken cancellationToken)
     {
         switch (operationName)
         {
@@ -192,6 +255,16 @@ public sealed class ChatService : IChatService
                             intent.Status);
                     }
 
+                    if (intent.Intent == IntentType.AnalyzeTicketDistribution)
+                    {
+                        var analysis = _ticketAnalysisProcessor.Analyze(
+                            ticketTable);
+
+                        return await GenerateTicketAnalysisAsync(
+                            analysis,
+                            cancellationToken);
+                    }
+
                     var totalTickets = ticketTable.Rows.Sum(row =>
                         int.TryParse(
                             row.LastOrDefault(),
@@ -235,6 +308,7 @@ public sealed class ChatService : IChatService
 
     private async Task<ChatResponse> HandleUnknownIntentAsync(
         string userMessage,
+        IReadOnlyList<ConversationMessage> previousMessages,
         CancellationToken cancellationToken)
     {
         var history = new ChatHistory();
@@ -247,7 +321,11 @@ public sealed class ChatService : IChatService
             - Searching registered users.
             - Retrieving ticket counts.
             - Retrieving ticket counts by status.
+            - Analyzing ticket distribution.
             - Retrieving registered groups.
+
+            Use previous conversation messages when they are relevant
+            to understanding the current question.
 
             If the user asks about something outside these capabilities,
             politely explain the supported capabilities.
@@ -256,6 +334,22 @@ public sealed class ChatService : IChatService
             Do not claim that an API operation was executed.
             """);
 
+        // Reconstruct the previous conversation.
+        foreach (var message in previousMessages)
+        {
+            switch (message.Role.ToLowerInvariant())
+            {
+                case "user":
+                    history.AddUserMessage(message.Content);
+                    break;
+
+                case "assistant":
+                    history.AddAssistantMessage(message.Content);
+                    break;
+            }
+        }
+
+        // Add the current user message.
         history.AddUserMessage(userMessage);
 
         var response = await _chatCompletion.GetChatMessageContentAsync(
@@ -266,6 +360,58 @@ public sealed class ChatService : IChatService
         {
             Reply = response.Content ?? string.Empty,
             ResponseType = "Text"
+        };
+    }
+
+    private async Task<ChatResponse> GenerateTicketAnalysisAsync(
+        TicketAnalysisSummary analysis,
+        CancellationToken cancellationToken)
+    {
+        var analysisJson = JsonSerializer.Serialize(
+            analysis,
+            new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+        var history = new ChatHistory();
+
+        history.AddSystemMessage("""
+            You are an enterprise business data analyst.
+
+            Your responsibility is to explain calculated business metrics.
+
+            Rules:
+            1. Use only the supplied analysis data.
+            2. Never invent or modify ticket counts or percentages.
+            3. Identify the highest-volume ticket status.
+            4. Identify the lowest-volume ticket status.
+            5. Explain the overall ticket distribution.
+            6. Mention important observations.
+            7. Do not assume that a high or low count indicates
+               a business problem without supporting context.
+            8. Keep the explanation concise and professional.
+            9. Do not return JSON or Markdown code fences.
+            """);
+
+        history.AddUserMessage($"""
+            Analyze the following calculated ticket metrics.
+
+            Analysis data:
+            {analysisJson}
+
+            Provide an executive summary of the ticket distribution.
+            """);
+
+        var response = await _chatCompletion.GetChatMessageContentAsync(
+            history,
+            cancellationToken: cancellationToken);
+
+        return new ChatResponse
+        {
+            Reply = response.Content ?? string.Empty,
+            ResponseType = "Analysis",
+            Analysis = analysis
         };
     }
 

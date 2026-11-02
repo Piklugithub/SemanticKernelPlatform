@@ -45,6 +45,8 @@ public static class DependencyInjection
         services.AddSingleton<ApiResponseProcessor>();
         services.AddSingleton<UserSearchProcessor>();
         services.AddSingleton<TicketCountProcessor>();
+        services.AddSingleton<TicketAnalysisProcessor>();
+
 
         // Plugins.
         services.AddScoped<PlatformInfoPlugin>();
@@ -77,6 +79,7 @@ public static class DependencyInjection
             return kernel;
         });
         services.AddScoped<IIntentExtractionService, IntentExtractionService>();
+        services.AddSingleton< IChatHistoryStore,InMemoryChatHistoryStore>();
 
         // Chat service.
         services.AddScoped<IChatService, ChatService>();

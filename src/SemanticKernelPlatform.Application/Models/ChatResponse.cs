@@ -2,11 +2,15 @@
 
 public sealed class ChatResponse
 {
+    public string ConversationId { get; set; } = string.Empty;
+
     public string Reply { get; set; } = string.Empty;
 
     public string ResponseType { get; set; } = "Text";
 
     public ChatTable? Table { get; set; }
+
+    public TicketAnalysisSummary? Analysis { get; set; }
 }
 
 public sealed class ChatTable

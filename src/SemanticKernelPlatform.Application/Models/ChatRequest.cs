@@ -1,8 +1,6 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+﻿
+namespace SemanticKernelPlatform.Application.Models;
 
-namespace SemanticKernelPlatform.Application.Models
-{
-    public sealed record ChatRequest(string Message);
-}
+public sealed record ChatRequest(
+    string Message,
+    string? ConversationId = null);

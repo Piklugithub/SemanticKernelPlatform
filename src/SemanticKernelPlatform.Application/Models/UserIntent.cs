@@ -23,5 +23,6 @@ public enum IntentType
     GetTicketCountsByStatus = 4,
 
     // Group-related operations
-    GetGroups = 5
+    GetGroups = 5,
+    AnalyzeTicketDistribution = 6
 }
