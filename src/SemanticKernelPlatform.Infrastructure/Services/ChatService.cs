@@ -21,6 +21,9 @@ public sealed class ChatService : IChatService
     private readonly TicketAnalysisProcessor _ticketAnalysisProcessor;
     private readonly IIntentExtractionService _intentExtractionService;
     private readonly IChatHistoryStore _chatHistoryStore;
+    private readonly IConversationDataStore _conversationDataStore;
+    private static readonly TimeSpan CacheDuration =
+    TimeSpan.FromMinutes(5);
 
     public ChatService(
         Kernel kernel,
@@ -30,7 +33,8 @@ public sealed class ChatService : IChatService
         TicketCountProcessor ticketCountProcessor,
         TicketAnalysisProcessor ticketAnalysisProcessor,
         IIntentExtractionService intentExtractionService,
-        IChatHistoryStore chatHistoryStore)
+        IChatHistoryStore chatHistoryStore,
+        IConversationDataStore conversationDataStore)
     {
         _kernel = kernel;
         _apiResponseContext = apiResponseContext;
@@ -40,6 +44,7 @@ public sealed class ChatService : IChatService
         _ticketAnalysisProcessor = ticketAnalysisProcessor;
         _intentExtractionService = intentExtractionService;
         _chatHistoryStore = chatHistoryStore;
+        _conversationDataStore = conversationDataStore;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -89,6 +94,7 @@ public sealed class ChatService : IChatService
                 response = await ExecuteApiOperationAsync(
                     "GetUsers",
                     intent,
+                    conversationId,
                     cancellationToken);
                 break;
 
@@ -97,17 +103,19 @@ public sealed class ChatService : IChatService
             case IntentType.AnalyzeTicketDistribution:
 
                 response = await ExecuteApiOperationAsync(
-                    "GetTicketStatusCounts",
-                    intent,
-                    cancellationToken);
+                 "GetUsers",
+                 intent,
+                 conversationId,
+                 cancellationToken);
                 break;
 
             case IntentType.GetGroups:
 
                 response = await ExecuteApiOperationAsync(
-                    "GetGroups",
-                    intent,
-                    cancellationToken);
+                 "GetGroups",
+                 intent,
+                 conversationId,
+                 cancellationToken);
                 break;
 
             case IntentType.Unknown:
@@ -156,11 +164,41 @@ public sealed class ChatService : IChatService
             cancellationToken);
     }
 
+
+
     private async Task<ChatResponse> ExecuteApiOperationAsync(
         string functionName,
         UserIntent intent,
+        string conversationId,
         CancellationToken cancellationToken)
     {
+        // Step 1: Retrieve cached data unless cache is bypassed.
+        ConversationData? cachedData = null;
+
+        if (intent.CachePolicy != CachePolicy.Bypass)
+        {
+            cachedData = await _conversationDataStore.GetAsync(
+                conversationId,
+                functionName,
+                cancellationToken);
+        }
+
+        // Step 2: Return valid cached data when UseCache is selected.
+        if (intent.CachePolicy == CachePolicy.UseCache &&
+            cachedData is not null &&
+            IsCacheValid(cachedData))
+        {
+            return await ProcessApiResponseAsync(
+                intent,
+                cachedData.OperationName,
+                cachedData.RawResponse,
+                cancellationToken);
+        }
+
+        // Step 3: Cache miss, expired data, or Refresh policy.
+        // Fetch fresh data from the actual API.
+        _apiResponseContext.Clear();
+
         var function = _kernel.Plugins.GetFunction(
             PluginName,
             functionName);
@@ -172,6 +210,7 @@ public sealed class ChatService : IChatService
         var rawResponse = _apiResponseContext.RawResponse;
         var operationName = _apiResponseContext.OperationName;
 
+        // Step 4: Handle API failures or missing response data.
         if (string.IsNullOrWhiteSpace(rawResponse) ||
             string.IsNullOrWhiteSpace(operationName))
         {
@@ -182,12 +221,35 @@ public sealed class ChatService : IChatService
             };
         }
 
+        // Step 5: Store successful API response unless cache is bypassed.
+        if (intent.CachePolicy != CachePolicy.Bypass)
+        {
+            await _conversationDataStore.SetAsync(
+                conversationId,
+                new ConversationData(
+                    operationName,
+                    rawResponse,
+                    DateTime.UtcNow),
+                cancellationToken);
+        }
+
+        // Step 6: Process the API response.
         return await ProcessApiResponseAsync(
             intent,
             operationName,
             rawResponse,
             cancellationToken);
     }
+
+
+    private static bool IsCacheValid(ConversationData data)
+    {
+        var age = DateTime.UtcNow - data.RetrievedAtUtc;
+
+        return age >= TimeSpan.Zero &&
+               age < CacheDuration;
+    }
+
 
     private async Task<ChatResponse> ProcessApiResponseAsync(
         UserIntent intent,

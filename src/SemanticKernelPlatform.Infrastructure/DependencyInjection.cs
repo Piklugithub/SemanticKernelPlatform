@@ -80,6 +80,7 @@ public static class DependencyInjection
         });
         services.AddScoped<IIntentExtractionService, IntentExtractionService>();
         services.AddSingleton< IChatHistoryStore,InMemoryChatHistoryStore>();
+        services.AddSingleton<IConversationDataStore,InMemoryConversationDataStore>();
 
         // Chat service.
         services.AddScoped<IChatService, ChatService>();

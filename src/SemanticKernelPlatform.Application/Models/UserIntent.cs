@@ -8,6 +8,8 @@ public sealed class UserIntent
     public string? SearchTerm { get; set; }
 
     public string? Status { get; set; }
+
+    public CachePolicy CachePolicy { get; set; } = CachePolicy.UseCache;
 }
 
 public enum IntentType

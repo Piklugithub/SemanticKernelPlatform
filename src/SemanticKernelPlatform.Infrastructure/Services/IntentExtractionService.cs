@@ -144,6 +144,28 @@ public sealed class IntentExtractionService : IIntentExtractionService
                 "searchTerm": null,
                 "status": null
             }
+
+            CACHE POLICY CLASSIFICATION:
+
+            1. UseCache:
+               Default policy for normal requests.
+
+            2. Refresh:
+               Use when the user explicitly requests fresh or latest data,
+               or asks to refresh/reload the information.
+
+            3. Bypass:
+               Use only when explicitly instructed not to use cached data.
+
+            Return cachePolicy in the JSON response.
+
+            Example:
+            {
+                "intent": "GetAllUsers",
+                "searchTerm": null,
+                "status": null,
+                "cachePolicy": "Refresh"
+            }
             """);
 
         // Add previous conversation as context.
@@ -219,6 +241,13 @@ public sealed class IntentExtractionService : IIntentExtractionService
     {
         var intent = result.Intent?.Trim().ToLowerInvariant();
 
+        var cachePolicy = result.CachePolicy?.Trim().ToLowerInvariant()
+        switch
+        {
+            "refresh" => CachePolicy.Refresh,
+            "bypass" => CachePolicy.Bypass,
+            _ => CachePolicy.UseCache
+        };
 
         var intentType = intent switch
         {
@@ -259,7 +288,8 @@ public sealed class IntentExtractionService : IIntentExtractionService
         {
             Intent = intentType,
             SearchTerm = result.SearchTerm?.Trim(),
-            Status = result.Status
+            Status = result.Status,
+            CachePolicy = cachePolicy
         };
 
     }
@@ -321,5 +351,7 @@ public sealed class IntentExtractionService : IIntentExtractionService
         public string? SearchTerm { get; set; }
 
         public string? Status { get; set; }
+
+        public string? CachePolicy { get; set; }
     }
 }
