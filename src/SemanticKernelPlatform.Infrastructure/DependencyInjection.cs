@@ -6,6 +6,7 @@ using SemanticKernelPlatform.Application.Interfaces;
 using SemanticKernelPlatform.Application.Plugins;
 using SemanticKernelPlatform.Infrastructure.Services;
 using SemanticKernelPlatform.Plugins;
+using SemanticKernelPlatform.Plugins.Analysis;
 using SemanticKernelPlatform.Plugins.Http;
 using SemanticKernelPlatform.Plugins.Platform;
 
@@ -55,6 +56,14 @@ public static class DependencyInjection
         // Plugin registry.
         services.AddScoped<IPluginRegistry, PluginRegistry>();
 
+        services.AddHttpClient<OllamaToolCallingClient>(client =>
+        {
+            client.BaseAddress = new Uri(
+                endpoint.TrimEnd('/') + "/");
+
+            client.Timeout = TimeSpan.FromSeconds(60);
+        });
+
         // Create a separate Kernel for each request scope.
         services.AddScoped<Kernel>(serviceProvider =>
         {
@@ -69,12 +78,32 @@ public static class DependencyInjection
             var pluginRegistry =
                 serviceProvider.GetRequiredService<IPluginRegistry>();
 
+
             foreach (var plugin in pluginRegistry.GetPlugins())
             {
                 kernel.Plugins.AddFromObject(
                     plugin.Instance,
                     plugin.Name);
             }
+
+            // Load the external prompt.
+            var promptPath = Path.Combine(
+                AppContext.BaseDirectory,
+                "Prompts",
+                "TicketAnalysis.txt");
+
+            if (!File.Exists(promptPath))
+            {
+                throw new FileNotFoundException(
+                    "Ticket analysis prompt file was not found.",
+                    promptPath);
+            }
+
+            var promptTemplate = File.ReadAllText(promptPath);
+
+            // Register the prompt-based plugin.
+            kernel.Plugins.Add(
+                TicketAnalysisPlugin.Create(promptTemplate));
 
             return kernel;
         });

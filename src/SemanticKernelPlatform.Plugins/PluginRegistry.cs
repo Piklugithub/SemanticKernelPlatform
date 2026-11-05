@@ -1,6 +1,9 @@
-﻿using SemanticKernelPlatform.Application.Plugins;
+﻿
+using Microsoft.SemanticKernel;
+using SemanticKernelPlatform.Application.Plugins;
 using SemanticKernelPlatform.Plugins.Http;
 using SemanticKernelPlatform.Plugins.Platform;
+using SemanticKernelPlatform.Plugins.Analysis;
 
 namespace SemanticKernelPlatform.Plugins;
 
@@ -22,5 +25,11 @@ public sealed class PluginRegistry : IPluginRegistry
     public IReadOnlyCollection<PluginDefinition> GetPlugins()
     {
         return _plugins;
+    }
+
+    public static KernelPlugin CreateTicketAnalysisPlugin(
+        string promptTemplate)
+    {
+        return TicketAnalysisPlugin.Create(promptTemplate);
     }
 }

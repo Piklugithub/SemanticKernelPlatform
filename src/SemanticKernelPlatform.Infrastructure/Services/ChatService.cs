@@ -5,6 +5,7 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using SemanticKernelPlatform.Application.Interfaces;
 using SemanticKernelPlatform.Application.Models;
+using SemanticKernelPlatform.Infrastructure.Models.Ollama;
 
 namespace SemanticKernelPlatform.Infrastructure.Services;
 
@@ -22,6 +23,7 @@ public sealed class ChatService : IChatService
     private readonly IIntentExtractionService _intentExtractionService;
     private readonly IChatHistoryStore _chatHistoryStore;
     private readonly IConversationDataStore _conversationDataStore;
+    private readonly OllamaToolCallingClient _ollamaToolCallingClient;
     private static readonly TimeSpan CacheDuration =
     TimeSpan.FromMinutes(5);
 
@@ -34,7 +36,8 @@ public sealed class ChatService : IChatService
         TicketAnalysisProcessor ticketAnalysisProcessor,
         IIntentExtractionService intentExtractionService,
         IChatHistoryStore chatHistoryStore,
-        IConversationDataStore conversationDataStore)
+        IConversationDataStore conversationDataStore,
+        OllamaToolCallingClient ollamaToolCallingClient)
     {
         _kernel = kernel;
         _apiResponseContext = apiResponseContext;
@@ -45,6 +48,7 @@ public sealed class ChatService : IChatService
         _intentExtractionService = intentExtractionService;
         _chatHistoryStore = chatHistoryStore;
         _conversationDataStore = conversationDataStore;
+        _ollamaToolCallingClient = ollamaToolCallingClient;
 
         _chatCompletion = _kernel.Services
             .GetRequiredService<IChatCompletionService>();
@@ -86,9 +90,23 @@ public sealed class ChatService : IChatService
         // Step 4: Execute the appropriate operation.
         ChatResponse response;
 
+
+
         switch (intent.Intent)
         {
             case IntentType.GetAllUsers:
+            case IntentType.GetGroups:
+            case IntentType.GetTicketCount:
+            case IntentType.GetTicketCountsByStatus:
+            case IntentType.AnalyzeTicketDistribution:
+
+                response = await ExecuteToolCallingAsync(
+                    request.Message,
+                    intent,
+                    conversationId,
+                    cancellationToken);
+                break;
+
             case IntentType.SearchUsers:
 
                 response = await ExecuteApiOperationAsync(
@@ -96,26 +114,6 @@ public sealed class ChatService : IChatService
                     intent,
                     conversationId,
                     cancellationToken);
-                break;
-
-            case IntentType.GetTicketCount:
-            case IntentType.GetTicketCountsByStatus:
-            case IntentType.AnalyzeTicketDistribution:
-
-                response = await ExecuteApiOperationAsync(
-                 "GetUsers",
-                 intent,
-                 conversationId,
-                 cancellationToken);
-                break;
-
-            case IntentType.GetGroups:
-
-                response = await ExecuteApiOperationAsync(
-                 "GetGroups",
-                 intent,
-                 conversationId,
-                 cancellationToken);
                 break;
 
             case IntentType.Unknown:
@@ -127,6 +125,8 @@ public sealed class ChatService : IChatService
                     cancellationToken);
                 break;
         }
+
+
 
         // Step 5: Attach the conversation ID to the response.
         response.ConversationId = conversationId;
@@ -485,4 +485,197 @@ public sealed class ChatService : IChatService
             ResponseType = "Text"
         };
     }
+
+
+
+
+
+    private async Task<ChatResponse> ExecuteToolCallingAsync(
+        string userMessage,
+        UserIntent intent,
+        string conversationId,
+        CancellationToken cancellationToken)
+    {
+        // Step 1: Ask Ollama to select an available tool.
+        var request = new OllamaChatRequest
+        {
+            Stream = false,
+            Messages =
+            [
+                new OllamaMessage
+            {
+                Role = "user",
+                Content = userMessage
+            }
+            ],
+            Tools = OllamaToolCatalog.GetTools().ToList()
+        };
+
+        var ollamaResponse = await _ollamaToolCallingClient.SendAsync(
+            request,
+            cancellationToken);
+
+        var toolCalls = ollamaResponse.Message?.ToolCalls;
+
+        if (toolCalls is null || toolCalls.Count != 1)
+        {
+            return CreateErrorResponse(
+                "The AI assistant did not return exactly one supported tool call.");
+        }
+
+        // Step 2: Map the selected Ollama tool to a Semantic Kernel function.
+        var selectedTool = toolCalls[0].Function?.Name;
+
+        var functionName = selectedTool?.ToLowerInvariant() switch
+        {
+            "get_users" => "GetUsers",
+            "get_groups" => "GetGroups",
+            "get_ticket_status_counts" => "GetTicketStatusCounts",
+            _ => null
+        };
+
+        if (functionName is null)
+        {
+            return CreateErrorResponse(
+                $"Unsupported tool requested by Ollama: {selectedTool}");
+        }
+
+        // Step 3: Ensure the selected tool is appropriate for the intent.
+        var expectedFunctionName = intent.Intent switch
+        {
+            IntentType.GetAllUsers => "GetUsers",
+            IntentType.GetGroups => "GetGroups",
+
+            IntentType.GetTicketCount or
+            IntentType.GetTicketCountsByStatus or
+            IntentType.AnalyzeTicketDistribution
+                => "GetTicketStatusCounts",
+
+            _ => null
+        };
+
+        if (!string.Equals(
+                functionName,
+                expectedFunctionName,
+                StringComparison.Ordinal))
+        {
+            return CreateErrorResponse(
+                "The selected tool does not match the requested business operation.");
+        }
+
+        // Step 4: Execute the existing Semantic Kernel workflow.
+        var apiResult = await ExecuteApiOperationAsync(
+            functionName,
+            intent,
+            conversationId,
+            cancellationToken);
+
+        // Step 5: Build a concise tool result.
+        var toolResult = BuildToolResult(apiResult);
+
+        // If the API operation failed, return the original result.
+        if (toolResult is null)
+        {
+            return apiResult;
+        }
+
+        // Step 6: Return the assistant's original tool call and its result.
+        var followUpRequest = new OllamaChatRequest
+        {
+            Stream = false,
+            Messages =
+            [
+                new OllamaMessage
+            {
+                Role = "user",
+                Content = userMessage
+            },
+            new OllamaMessage
+            {
+                Role = "assistant",
+                Content = ollamaResponse.Message?.Content ?? string.Empty,
+                ToolCalls = toolCalls
+            },
+            new OllamaMessage
+            {
+                Role = "tool",
+                ToolName = selectedTool,
+                Content = toolResult
+            }
+            ],
+            Tools = OllamaToolCatalog.GetTools().ToList()
+        };
+
+        // Step 7: Generate the final response.
+        var finalResponse = await _ollamaToolCallingClient.SendAsync(
+            followUpRequest,
+            cancellationToken);
+
+        var finalReply = finalResponse.Message?.Content;
+
+        if (string.IsNullOrWhiteSpace(finalReply))
+        {
+            return apiResult;
+        }
+
+        apiResult.Reply = finalReply;
+
+        return apiResult;
+    }
+
+
+    private static string? BuildToolResult(ChatResponse response)
+    {
+        // Do not ask the LLM to explain a failed API operation.
+        if (response.Reply.StartsWith(
+                "API_CALL_FAILED",
+                StringComparison.OrdinalIgnoreCase) ||
+            response.Reply.StartsWith(
+                "API_RESPONSE_INVALID_JSON",
+                StringComparison.OrdinalIgnoreCase) ||
+            response.Reply.StartsWith(
+                "Unable to connect",
+                StringComparison.OrdinalIgnoreCase) ||
+            response.Reply.StartsWith(
+                "The API request timed out",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return response.ResponseType switch
+        {
+            "Table" when response.Table is not null =>
+                $"""
+            The requested API operation completed successfully.
+            Table title: {response.Table.Title}
+            Total records: {response.Table.TotalRecords}
+            The application has prepared the complete structured table.
+            Do not invent or reproduce individual records.
+            """,
+
+            "Analysis" when response.Analysis is not null =>
+                $"""
+            The ticket analysis operation completed successfully.
+
+            Calculated analysis:
+            {JsonSerializer.Serialize(response.Analysis)}
+
+            Use only the supplied analysis values.
+            Do not invent or modify business metrics.
+            """,
+
+            "Text" when !string.IsNullOrWhiteSpace(response.Reply) =>
+                $"""
+            The requested business operation completed.
+
+            Result:
+            {response.Reply}
+            """,
+
+            _ => null
+        };
+    }
+
+
 }
