@@ -109,8 +109,8 @@ public sealed class ChatService : IChatService
 
             case IntentType.SearchUsers:
 
-                response = await ExecuteApiOperationAsync(
-                    "GetUsers",
+                response = await ExecuteToolCallingAsync(
+                    request.Message,
                     intent,
                     conversationId,
                     cancellationToken);
@@ -490,6 +490,7 @@ public sealed class ChatService : IChatService
 
 
 
+
     private async Task<ChatResponse> ExecuteToolCallingAsync(
         string userMessage,
         UserIntent intent,
@@ -515,6 +516,7 @@ public sealed class ChatService : IChatService
             request,
             cancellationToken);
 
+        // Step 2: Validate the tool-call response.
         var toolCalls = ollamaResponse.Message?.ToolCalls;
 
         if (toolCalls is null || toolCalls.Count != 1)
@@ -523,14 +525,25 @@ public sealed class ChatService : IChatService
                 "The AI assistant did not return exactly one supported tool call.");
         }
 
-        // Step 2: Map the selected Ollama tool to a Semantic Kernel function.
-        var selectedTool = toolCalls[0].Function?.Name;
+        var selectedFunction = toolCalls[0].Function;
 
-        var functionName = selectedTool?.ToLowerInvariant() switch
+        if (selectedFunction is null ||
+            string.IsNullOrWhiteSpace(selectedFunction.Name))
+        {
+            return CreateErrorResponse(
+                "The AI assistant returned an invalid tool call.");
+        }
+
+        var selectedTool = selectedFunction.Name;
+
+        // Step 3: Map the selected Ollama tool to a Semantic Kernel function.
+        var functionName = selectedTool.ToLowerInvariant() switch
         {
             "get_users" => "GetUsers",
+            "search_users" => "GetUsers",
             "get_groups" => "GetGroups",
             "get_ticket_status_counts" => "GetTicketStatusCounts",
+            "get_ticket_count" => "GetTicketStatusCounts",
             _ => null
         };
 
@@ -540,37 +553,70 @@ public sealed class ChatService : IChatService
                 $"Unsupported tool requested by Ollama: {selectedTool}");
         }
 
-        // Step 3: Ensure the selected tool is appropriate for the intent.
-        var expectedFunctionName = intent.Intent switch
+        // Step 4: Ensure the selected tool is appropriate for the intent.
+        var expectedToolName = intent.Intent switch
         {
-            IntentType.GetAllUsers => "GetUsers",
-            IntentType.GetGroups => "GetGroups",
+            IntentType.GetAllUsers => "get_users",
+            IntentType.SearchUsers => "search_users",
+            IntentType.GetGroups => "get_groups",
 
-            IntentType.GetTicketCount or
+            IntentType.GetTicketCount => "get_ticket_count",
+
             IntentType.GetTicketCountsByStatus or
-            IntentType.AnalyzeTicketDistribution
-                => "GetTicketStatusCounts",
+            IntentType.AnalyzeTicketDistribution => "get_ticket_status_counts",
 
             _ => null
         };
 
         if (!string.Equals(
-                functionName,
-                expectedFunctionName,
-                StringComparison.Ordinal))
+         selectedTool,
+         expectedToolName,
+         StringComparison.OrdinalIgnoreCase))
         {
             return CreateErrorResponse(
                 "The selected tool does not match the requested business operation.");
         }
 
-        // Step 4: Execute the existing Semantic Kernel workflow.
+        // Step 5: Reset and validate dynamic arguments.
+        intent.SearchTerm = null;
+        intent.Status = null;
+
+        // Validate user-search arguments.
+        if (intent.Intent == IntentType.SearchUsers)
+        {
+            if (!TryGetSearchTerm(
+                    selectedFunction.Arguments,
+                    out var searchTerm))
+            {
+                return CreateErrorResponse(
+                    "The AI assistant did not provide a valid user search term.");
+            }
+
+            intent.SearchTerm = searchTerm;
+        }
+
+        // Validate ticket-count arguments.
+        if (intent.Intent == IntentType.GetTicketCount)
+        {
+            if (!TryGetTicketStatus(
+                    selectedFunction.Arguments,
+                    out var status))
+            {
+                return CreateErrorResponse(
+                    "The AI assistant did not provide a valid ticket status.");
+            }
+
+            intent.Status = status;
+        }
+
+        // Step 6: Execute the existing Semantic Kernel workflow.
         var apiResult = await ExecuteApiOperationAsync(
             functionName,
             intent,
             conversationId,
             cancellationToken);
 
-        // Step 5: Build a concise tool result.
+        // Step 7: Build a concise tool result.
         var toolResult = BuildToolResult(apiResult);
 
         // If the API operation failed, return the original result.
@@ -579,7 +625,7 @@ public sealed class ChatService : IChatService
             return apiResult;
         }
 
-        // Step 6: Return the assistant's original tool call and its result.
+        // Step 8: Return the assistant's original tool call and its result.
         var followUpRequest = new OllamaChatRequest
         {
             Stream = false,
@@ -602,14 +648,20 @@ public sealed class ChatService : IChatService
                 ToolName = selectedTool,
                 Content = toolResult
             }
-            ],
-            Tools = OllamaToolCatalog.GetTools().ToList()
+            ]
         };
 
-        // Step 7: Generate the final response.
+        // Step 9: Generate the final response.
         var finalResponse = await _ollamaToolCallingClient.SendAsync(
             followUpRequest,
             cancellationToken);
+
+        // Do not silently accept another tool call.
+        if (finalResponse.Message?.ToolCalls is { Count: > 0 })
+        {
+            return CreateErrorResponse(
+                "Additional tool calls are not supported in this execution cycle yet.");
+        }
 
         var finalReply = finalResponse.Message?.Content;
 
@@ -618,10 +670,13 @@ public sealed class ChatService : IChatService
             return apiResult;
         }
 
+        // Step 10: Preserve the structured response.
         apiResult.Reply = finalReply;
 
         return apiResult;
     }
+
+
 
 
     private static string? BuildToolResult(ChatResponse response)
@@ -646,13 +701,16 @@ public sealed class ChatService : IChatService
         return response.ResponseType switch
         {
             "Table" when response.Table is not null =>
-                $"""
-            The requested API operation completed successfully.
-            Table title: {response.Table.Title}
-            Total records: {response.Table.TotalRecords}
-            The application has prepared the complete structured table.
-            Do not invent or reproduce individual records.
-            """,
+                JsonSerializer.Serialize(new
+                {
+                    response.Table.Title,
+                    response.Table.TotalRecords,
+                    ReturnedRows = response.Table.Rows.Count > 20
+                        ? 20
+                        : response.Table.Rows.Count,
+                    response.Table.Columns,
+                    Rows = response.Table.Rows.Take(20).ToList()
+                }),
 
             "Analysis" when response.Analysis is not null =>
                 $"""
@@ -677,5 +735,85 @@ public sealed class ChatService : IChatService
         };
     }
 
+
+
+    private static bool TryGetSearchTerm(
+        JsonElement arguments,
+        out string searchTerm)
+    {
+        searchTerm = string.Empty;
+
+        if (arguments.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!arguments.TryGetProperty(
+                "searchTerm",
+                out var searchTermElement))
+        {
+            return false;
+        }
+
+        if (searchTermElement.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var value = searchTermElement.GetString()?.Trim();
+
+        if (string.IsNullOrWhiteSpace(value) || value.Length > 100)
+        {
+            return false;
+        }
+
+        searchTerm = value;
+
+        return true;
+    }
+
+    private static bool TryGetTicketStatus(
+    JsonElement arguments,
+    out string status)
+    {
+        status = string.Empty;
+
+        if (arguments.ValueKind != JsonValueKind.Object ||
+            !arguments.TryGetProperty("status", out var statusElement) ||
+            statusElement.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var value = statusElement.GetString()?.Trim();
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var supportedStatuses = new[]
+        {
+        "Open",
+        "Active",
+        "Resolved",
+        "On Hold"
+    };
+
+        var matchedStatus = supportedStatuses.FirstOrDefault(
+            supported => string.Equals(
+                supported,
+                value,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (matchedStatus is null)
+        {
+            return false;
+        }
+
+        status = matchedStatus;
+
+        return true;
+    }
 
 }
